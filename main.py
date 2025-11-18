@@ -1,10 +1,22 @@
+"""
+GIGA Shorty - Minimal FastAPI-powered URL shortener.
+
+This module defines a small URL shortener service backed by a MySQL database.
+It supports:
+
+* Random and custom short codes
+* Optional expiration (TTL)
+* Visit counting
+* Token-based admin protection for link creation
+"""
+
 import os
 import secrets
 import string
 import hashlib
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -17,15 +29,20 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.engine import URL as DBUrl
 
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
 MYSQL_USER = os.getenv("MYSQL_USER", "shortener_user")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
 MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_DB = os.getenv("MYSQL_DB", "shortener")
+
 TOKENS_ENV = os.getenv("ADMIN_TOKENS", "")
 
-ADMIN_TOKENS = {t.strip() for t in TOKENS_ENV.split(",") if t.strip()}
-
+ADMIN_TOKENS = { t.strip() for t in TOKENS_ENV.split(",") if t.strip() }
 if not ADMIN_TOKENS:
     raise RuntimeError("ADMIN_TOKENS is not configured; set it in the environment.")
 
@@ -37,6 +54,11 @@ DATABASE_URL = DBUrl.create(
     port=MYSQL_PORT,
     database=MYSQL_DB,
 )
+
+
+# ============================================================================
+# Database setup
+# ============================================================================
 
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 
@@ -50,7 +72,33 @@ AsyncSessionLocal = sessionmaker(
 
 Base = declarative_base()
 
+
+# ============================================================================
+# ORM models
+# ============================================================================
+
 class URL(Base):
+    """URL mapping model.
+
+    Represents a single shortened URL, including optional expiration
+    and a basic visit counter.
+
+    Attributes
+    ----------
+    id : int
+        Primary key.
+    short_code : str
+        Unique short code used in the path (e.g., ``/abc123``).
+    target_url : str
+        Original URL to redirect to.
+    created_by_token : str or None
+        SHA-256 hash of the admin token used to create this URL.
+    expires_at : datetime or None
+        UTC expiration timestamp. ``None`` means the URL never expires.
+    visit_count : int
+        Number of successful redirects performed for this URL.
+    """
+
     __tablename__ = "urls"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -60,50 +108,130 @@ class URL(Base):
     expires_at = Column(DateTime, nullable=True, index=True)
     visit_count = Column(Integer, nullable=False, default=0)
 
+
 class TTL(str, Enum):
+    """Time-to-live choices for shortened URLs."""
+
     permanent = "permanent"
     hour = "1h"
     day = "1d"
     week = "1w"
 
 
+# ============================================================================
+# Utility functions
+# ============================================================================
+
 def hash_token(token: str) -> str:
+    """Hash an admin token using SHA-256.
+
+    Parameters
+    ----------
+    token : str
+        Raw admin token as provided by the user or environment.
+
+    Returns
+    -------
+    str
+        Hex-encoded SHA-256 digest of the token.
+    """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def compute_expires_at(ttl: TTL) -> Optional[datetime]:
+    """Compute expiration timestamp for a given TTL.
+
+    Parameters
+    ----------
+    ttl : TTL
+        Time-to-live value, e.g. ``TTL.hour`` or ``TTL.permanent``.
+
+    Returns
+    -------
+    datetime or None
+        UTC timestamp at which the URL should expire, or ``None`` if
+        the URL should never expire.
+    """
     now = datetime.utcnow()
     if ttl == TTL.hour:
         return now + timedelta(hours=1)
-    elif ttl == TTL.day:
+    if ttl == TTL.day:
         return now + timedelta(days=1)
-    elif ttl == TTL.week:
+    if ttl == TTL.week:
         return now + timedelta(weeks=1)
-    else:
-        return None  # permanent
+    return None  # permanent
 
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
+
+def generate_code(length: int = 6) -> str:
+    """Generate a random short code.
+
+    Parameters
+    ----------
+    length : int, optional
+        Length of the generated code, by default 6.
+
+    Returns
+    -------
+    str
+        Random alphanumeric code.
+    """
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+# ============================================================================
+# Pydantic schemas
+# ============================================================================
 
 class URLCreate(BaseModel):
+    """Schema for creating a random short URL."""
+
     target_url: AnyHttpUrl
     ttl: TTL = TTL.permanent
 
+
 class CustomURLCreate(BaseModel):
+    """Schema for creating a short URL with a custom code."""
+
     target_url: AnyHttpUrl
     custom_code: str
     ttl: TTL = TTL.permanent
 
-def generate_code(length: int = 6) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
 
-app = FastAPI(title="GIGA Shorty")
+# ============================================================================
+# Dependency injection
+# ============================================================================
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Yield an async database session.
 
-async def require_admin(x_admin_token: str = Header(None)):
+    Returns
+    -------
+    AsyncGenerator[AsyncSession, None]
+        Async SQLAlchemy session generator for use with FastAPI dependencies.
+    """
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
+async def require_admin(x_admin_token: str = Header(None)) -> str:
+    """Validate the admin token from the request headers.
+
+    Parameters
+    ----------
+    x_admin_token : str, optional
+        Value of the ``X-Admin-Token`` header.
+
+    Returns
+    -------
+    str
+        The validated token.
+
+    Raises
+    ------
+    HTTPException
+        If the token is missing or not in the allowed set.
+    """
     if not x_admin_token or x_admin_token not in ADMIN_TOKENS:
         raise HTTPException(
             status_code=401,
@@ -111,13 +239,34 @@ async def require_admin(x_admin_token: str = Header(None)):
         )
     return x_admin_token
 
+
+# ============================================================================
+# FastAPI app and routes
+# ============================================================================
+
+app = FastAPI(title="GIGA Shorty")
+
+# Static files (for favicon, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
 @app.on_event("startup")
-async def on_startup():
+async def on_startup() -> None:
+    """Create database tables on startup if they do not exist."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+
 @app.get("/", response_class=HTMLResponse)
-async def ui():
+async def ui() -> str:
+    """Serve the minimal HTML UI.
+
+    Returns
+    -------
+    str
+        HTML page containing the Tailwind-based user interface for
+        creating short URLs.
+    """
     return """
 <!DOCTYPE html>
 <html lang="en">
@@ -385,6 +534,24 @@ async def create_short_url(
     db: AsyncSession = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
+    """Create a short URL with a random code.
+
+    Parameters
+    ----------
+    data : URLCreate
+        Payload containing the target URL and TTL.
+    request : Request
+        Incoming FastAPI request instance.
+    db : AsyncSession
+        Database session dependency.
+    admin_token : str
+        Validated admin token from the headers.
+
+    Returns
+    -------
+    dict
+        JSON response with the short URL and its expiration timestamp.
+    """
     # generate a unique code
     while True:
         code = generate_code()
@@ -420,6 +587,29 @@ async def create_custom_short_url(
     db: AsyncSession = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
+    """Create a short URL with a custom code.
+
+    Parameters
+    ----------
+    data : CustomURLCreate
+        Payload containing the target URL, desired custom code, and TTL.
+    request : Request
+        Incoming FastAPI request instance.
+    db : AsyncSession
+        Database session dependency.
+    admin_token : str
+        Validated admin token from the headers.
+
+    Returns
+    -------
+    dict
+        JSON response with the short URL and its expiration timestamp.
+
+    Raises
+    ------
+    HTTPException
+        If the custom code is invalid or already in use.
+    """
     code = data.custom_code.strip()
 
     if not code or len(code) > 10:
@@ -472,7 +662,29 @@ async def create_custom_short_url(
 
 
 @app.get("/{code}")
-async def redirect_to_target(code: str, db: AsyncSession = Depends(get_db)):
+async def redirect_to_target(
+    code: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Redirect from a short code to the target URL.
+
+    Parameters
+    ----------
+    code : str
+        Short code segment from the path.
+    db : AsyncSession
+        Database session dependency.
+
+    Returns
+    -------
+    RedirectResponse
+        HTTP redirect to the target URL.
+
+    Raises
+    ------
+    HTTPException
+        If the short code does not exist or has expired.
+    """
     result = await db.execute(select(URL).where(URL.short_code == code))
     url_obj = result.scalars().first()
 
@@ -481,7 +693,7 @@ async def redirect_to_target(code: str, db: AsyncSession = Depends(get_db)):
 
     now = datetime.utcnow()
     if url_obj.expires_at and url_obj.expires_at <= now:
-      raise HTTPException(status_code=410, detail="Short URL has expired")
+        raise HTTPException(status_code=410, detail="Short URL has expired")
 
     # increment visit count
     url_obj.visit_count = (url_obj.visit_count or 0) + 1
