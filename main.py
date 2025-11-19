@@ -263,7 +263,7 @@ async def ui() -> FileResponse:
 
     Returns
     -------
-    str
+    FileResponse
         HTML page containing the Tailwind-based user interface for
         creating short URLs.
     """
