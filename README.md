@@ -12,6 +12,8 @@ It gives you:
 
 Designed to run nicely on a small VPS.
 
+Main Repository: [git.lalonso.com](https://git.lalonso.com/luis_alonso/shorty)
+
 ---
 
 ## Features
